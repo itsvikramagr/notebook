@@ -1,0 +1,235 @@
+{
+  "paragraphs": [
+    {
+      "title": "1. Install and run kafka on cluster master (Demo purposes)",
+      "text": "%sh\n\nsudo -u ec2-user -s \u003c\u003cEOF\ncd /home/ec2-user\nrm -rf kafka_2.11-0.10.0.0.tgz kafka_2.11-0.10.0.0 kafka\nwget --quiet http://www.us.apache.org/dist/kafka/0.10.0.0/kafka_2.11-0.10.0.0.tgz -O /home/ec2-user/kafka_2.11-0.10.0.0.tgz\nmkdir -p kafka\ntar zxf kafka_2.11-0.10.0.0.tgz -C kafka --strip-components 1\nEOF\n#ps auxwww | grep -w org.apache.zookeeper.server.quorum.QuorumPeerMain | xargs kill -9\n#ps auxwww | grep -w kafka.Kafka | xargs kill -9\nmkdir -p /media/ephemeral0/kafka\nchown -R ec2-user:ec2-user /media/ephemeral0/kafka\nmkdir -p /media/ephemeral0/zookeeper\nchown -R ec2-user:ec2-user /media/ephemeral0/zookeeper\n\nsudo -u ec2-user -s \u003c\u003cEOF\ncd ~/kafka\nsed -i \u0027s|log.dirs\u003d/tmp/kafka-logs|log.dirs\u003d/media/ephemeral0/kafka|g\u0027 config/server.properties\nsed -i \u0027s|dataDir\u003d/tmp/zookeeper|dataDir\u003d/media/ephemeral0/zookeeper|g\u0027 config/zookeeper.properties\nbin/zookeeper-server-start.sh -daemon config/zookeeper.properties\nsleep 10\nbin/kafka-server-start.sh -daemon config/server.properties\nsleep 20\nEOF\n\nsu - ec2-user -c \"cd ~/kafka; bin/kafka-topics.sh --create --zookeeper localhost:2181 --replication-factor 1 --partitions 4 --topic qubole\"\nsu - ec2-user -c  \"cd ~/kafka; bin/kafka-topics.sh --describe --zookeeper localhost:2181; echo\"\n",
+      "user": "vagrawal@qubole.com",
+      "dateUpdated": "Jun 12, 2017 8:24:22 AM",
+      "config": {
+        "colWidth": 12.0,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "editorMode": "ace/mode/scala",
+        "title": true,
+        "enabled": true,
+        "editorHide": false
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1450254642672_1047153132",
+      "id": "20151216-083042_491404590",
+      "dateCreated": "Dec 16, 2015 8:30:42 AM",
+      "dateStarted": "Jun 12, 2017 8:08:57 AM",
+      "dateFinished": "Jun 12, 2017 8:09:34 AM",
+      "status": "FINISHED",
+      "errorMessage": "",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "2. Set up Structured Streaming",
+      "text": "import sys.process._\nimport org.apache.spark.sql.SparkSession\nimport org.apache.spark.sql.functions._\nimport org.apache.spark.sql.streaming._\nimport org.apache.spark.sql.types._\n\nimport org.apache.kafka.clients.producer.{ProducerConfig, KafkaProducer, ProducerRecord}\nimport org.apache.spark.streaming.kafka._\nimport org.apache.spark.streaming.kafka.KafkaUtils\n\nimport org.apache.kafka.clients.producer.{ProducerConfig, KafkaProducer, ProducerRecord}\nimport java.util.HashMap\n\nobject QuboleKafka extends Serializable {\n    \n    val zkhost \u003d (\"/usr/lib/spark/bin/qcmd master-public-dns\".!!).trim\n    val kafkahost \u003d zkhost\n    val zkhostport \u003d s\"$zkhost:2181\"\n    val topics \u003d \"qubole\"\n    val topicMap \u003d topics.split(\",\").map((_, 4)).toMap\n    val topicToSend \u003d topics.split(\",\")(0)\n    val group \u003d \"group\"\n    val brokers \u003d s\"$kafkahost:9092\"\n\n    val props \u003d new HashMap[String, Object]()\n    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, brokers)\n    props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,\n      \"org.apache.kafka.common.serialization.StringSerializer\")\n    props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG,\n      \"org.apache.kafka.common.serialization.StringSerializer\")\n      \n    @transient var producer : KafkaProducer[String, String] \u003d null\n    var messageId : Long \u003d 1\n    @transient var query : StreamingQuery \u003d null\n\n    // Start of get Spark Session. This is starting pointing of streaming job\n    val spark \u003d SparkSession.builder.appName(\"kafka streaming Example\").getOrCreate()\n\n    def start() \u003d {\n        //Start producer for kafka\n        producer \u003d new KafkaProducer[String, String](props)\n        \n        //Creare a datastream from Kafka topics. StartingOffsets if earliest. So we always read from beginning of the kafka queue\n        val df \u003d spark\n            .readStream\n            .format(\"kafka\")\n            .option(\"kafka.bootstrap.servers\", brokers)\n            .option(\"subscribe\", topics)\n            .option(\"startingOffsets\", \"earliest\")\n            .load()\n        \n        df.printSchema()  \n        \n        // covert datastream into a datasets and convert the stream into multiple rows by applying appropriate schema\n        val ds \u003d df.selectExpr(\"CAST(key AS STRING)\", \"CAST(value AS STRING)\").as[(String, String)]\n        \n        // write your streaming job here. We can have multple streaming query on same datasets. \n        // Here we are aggregating the rows by the message and saving it as a table in memory\n        query \u003d ds\n            .select(\"value\").groupBy(\"value\").count()\n            .writeStream\n            .queryName(\"aggregates\")\n            .format(\"memory\")\n            .outputMode(\"complete\")\n            .start()\n    }\n    \n    // Any sql query on output table\n    def print10Rows() \u003d {\n        spark.sql(\"select * from aggregates limit 10\").show()\n    }\n    \n    def stop() \u003d {\n        spark.stop()\n    }\n    \n    def printExplain() \u003d {\n        query.explain()\n    }\n    \n    def printStatus() \u003d {\n        query.recentProgress\n    }\n\n    // Send message to kafka\n    def send(msg: String) \u003d {\n        val message \u003d new ProducerRecord[String, String](topicToSend, null, s\"$msg\")\n        messageId \u003d messageId + 1\n        producer.send(message)\n    }\n\n}",
+      "user": "vagrawal@qubole.com",
+      "dateUpdated": "Jun 12, 2017 8:27:17 AM",
+      "config": {
+        "colWidth": 12.0,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "enabled": true,
+        "editorMode": "ace/mode/scala",
+        "title": true,
+        "editorHide": false
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1497251434905_-317975952",
+      "id": "20170612-071034_401269960",
+      "dateCreated": "Jun 12, 2017 7:10:34 AM",
+      "dateStarted": "Jun 12, 2017 8:20:42 AM",
+      "dateFinished": "Jun 12, 2017 8:20:49 AM",
+      "status": "FINISHED",
+      "errorMessage": "",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "3. Start streaming",
+      "text": "QuboleKafka.start\nQuboleKafka.printExplain",
+      "user": "vagrawal@qubole.com",
+      "dateUpdated": "Jun 12, 2017 8:23:02 AM",
+      "config": {
+        "colWidth": 6.0,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "editorMode": "ace/mode/scala",
+        "title": true,
+        "enabled": true,
+        "editorHide": false
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1450254774841_795728210",
+      "id": "20151216-083254_105802775",
+      "dateCreated": "Dec 16, 2015 8:32:54 AM",
+      "dateStarted": "Jun 12, 2017 8:20:54 AM",
+      "dateFinished": "Jun 12, 2017 8:20:57 AM",
+      "status": "ERROR",
+      "errorMessage": "",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "4. Send data to Kafka",
+      "text": "for (i \u003c- 1 to 10) { QuboleKafka.send(s\"Hello $i\") }",
+      "user": "vagrawal@qubole.com",
+      "dateUpdated": "Jun 12, 2017 8:23:50 AM",
+      "config": {
+        "colWidth": 6.0,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "enabled": true,
+        "editorMode": "ace/mode/scala",
+        "title": true
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1496833960478_312302716",
+      "id": "20170607-111240_1729784605",
+      "dateCreated": "Jun 7, 2017 11:12:40 AM",
+      "dateStarted": "Jun 12, 2017 8:21:18 AM",
+      "dateFinished": "Jun 12, 2017 8:21:22 AM",
+      "status": "FINISHED",
+      "errorMessage": "",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "5. Display output table",
+      "text": "QuboleKafka.print10Rows\nQuboleKafka.printStatus",
+      "user": "vagrawal@qubole.com",
+      "dateUpdated": "Jun 12, 2017 8:23:14 AM",
+      "config": {
+        "colWidth": 12.0,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "title": true,
+        "editorMode": "ace/mode/scala",
+        "enabled": true,
+        "editorHide": false
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1450256657368_739882364",
+      "id": "20151216-090417_123659800",
+      "dateCreated": "Dec 16, 2015 9:04:17 AM",
+      "dateStarted": "Jun 12, 2017 8:21:26 AM",
+      "dateFinished": "Jun 12, 2017 8:21:27 AM",
+      "status": "FINISHED",
+      "errorMessage": "",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "6. Stop streaming",
+      "text": "QuboleKafka.stop",
+      "user": "vagrawal@qubole.com",
+      "dateUpdated": "Jun 12, 2017 8:24:06 AM",
+      "config": {
+        "colWidth": 12.0,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "editorMode": "ace/mode/scala",
+        "title": true,
+        "enabled": true
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1450256982033_1693181225",
+      "id": "20151216-090942_912639423",
+      "result": {
+        "code": "SUCCESS",
+        "type": "TEXT",
+        "msg": ""
+      },
+      "dateCreated": "Dec 16, 2015 9:09:42 AM",
+      "dateStarted": "Jun 12, 2017 8:24:06 AM",
+      "dateFinished": "Jun 12, 2017 8:24:07 AM",
+      "status": "FINISHED",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "config": {},
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1497255846139_-75671754",
+      "id": "20170612-082406_1091834661",
+      "dateCreated": "Jun 12, 2017 8:24:06 AM",
+      "status": "READY",
+      "progressUpdateIntervalMs": 500
+    }
+  ],
+  "name": "Structured Streaming - Kafka",
+  "id": "7Z8ETQE7PA1496826593",
+  "angularObjects": {
+    "2CHSXEG9G319911496386231592": [],
+    "2CKFSBHSP319911496386231587": [],
+    "2CGZG52PH319911496386231546": [],
+    "2CJYTVQ87319911496386231584": []
+  },
+  "config": {
+    "looknfeel": "default"
+  },
+  "info": {},
+  "source": "FCN"
+}
